@@ -80,14 +80,18 @@ jobs:
       - name: dbt deps
         run: dbt deps || true
 
-      # Download prod manifest from last prod deploy
-      # continue-on-error: true → first run ever has no artifact yet
+      # Download prod manifest from the latest successful CD run on main
+      # actions/download-artifact only sees SAME run — so we use this action
+      # which can fetch artifacts across workflow runs / branches
       - name: Download prod manifest (for defer)
-        id: download-artifact
-        uses: actions/download-artifact@v4
+        uses: dawidd6/action-download-artifact@v6
         with:
           name: prod-manifest
           path: /tmp/prod-artifacts
+          workflow: dbt_cicd.yml
+          branch: main
+          workflow_conclusion: success
+          if_no_artifact_found: warn      # first run has none, that's ok
         continue-on-error: true
 
       - name: Check defer state available
