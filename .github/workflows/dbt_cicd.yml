@@ -1,0 +1,157 @@
+# ============================================================
+# dbt CI/CD — Slim CI with dbt defer
+# Based on: https://blog.pmunhoz.com/blog/dbt/dbt-defer-optimize-cicd-pipelines/
+#
+# HOW IT WORKS:
+#   CD (merge to main):
+#     - full dbt build --target prod
+#     - uploads target/manifest.json as GitHub artifact "prod-manifest"
+#
+#   CI (on PR):
+#     - downloads "prod-manifest" artifact → /tmp/prod-artifacts/
+#     - dbt build --select state:modified+   (only changed models)
+#                 --defer                    (use prod for unchanged)
+#                 --state /tmp/prod-artifacts
+#     - if no artifact yet (first ever run) → full build fallback
+#
+# RESULT:
+#   Only changed models + downstream build on every PR
+#   75% faster CI on large projects
+#
+# SECRETS: SNOWFLAKE_ACCOUNT only
+# ENVIRONMENT: prod
+# ============================================================
+name: dbt CI/CD (WIF + Defer)
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ============================================================
+  # CI: Lint + Slim dbt build (changed models only)
+  # ============================================================
+  lint:
+    if: github.event_name == 'pull_request'
+    name: Lint YAML + SQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install linters
+        run: pip install yamllint sqlfluff
+      - name: YAML Lint
+        run: yamllint -c .yamllint.yml dbt_project.yml profiles.yml
+      - name: SQL Lint
+        run: sqlfluff lint models/ --dialect snowflake --ignore templating
+
+  build-ci:
+    if: github.event_name == 'pull_request'
+    name: dbt build → DEV_${{ github.actor }} (changed only)
+    needs: [lint]
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      DBT_PROFILES_DIR: .
+      GITHUB_ACTOR: ${{ github.actor }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Snowflake (WIF)
+        uses: ./.github/actions/setup-snowflake
+        with:
+          environment: ci
+          snowflake-account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+
+      - name: Install dbt
+        run: pip install dbt-snowflake
+
+      - name: dbt deps
+        run: dbt deps || true
+
+      # Download prod manifest from last prod deploy
+      # continue-on-error: true → first run ever has no artifact yet
+      - name: Download prod manifest (for defer)
+        id: download-artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: prod-manifest
+          path: /tmp/prod-artifacts
+        continue-on-error: true
+
+      - name: Check defer state available
+        run: |
+          if [ -f /tmp/prod-artifacts/manifest.json ]; then
+            echo "DEFER_AVAILABLE=true" >> $GITHUB_ENV
+            echo "✅ Prod manifest found — Slim CI: only changed models + downstream"
+          else
+            echo "DEFER_AVAILABLE=false" >> $GITHUB_ENV
+            echo "⚠️ No prod manifest yet — full build (first run or no prod deploy yet)"
+          fi
+
+      # Slim CI: only changed models + downstream
+      - name: dbt build → DEV_${{ github.actor }}
+        run: |
+          if [ "$DEFER_AVAILABLE" = "true" ]; then
+            echo "Running Slim CI: state:modified+ with defer"
+            dbt build \
+              --target ci \
+              --select state:modified+ \
+              --defer \
+              --state /tmp/prod-artifacts
+          else
+            echo "Running full build (no prod manifest available)"
+            dbt build --target ci
+          fi
+
+  # ============================================================
+  # CD: Full build to PROD + upload manifest as artifact
+  # ============================================================
+  deploy-prod:
+    if: github.event_name == 'push'
+    name: dbt build → PROD (full)
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      DBT_PROFILES_DIR: .
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Snowflake (WIF)
+        uses: ./.github/actions/setup-snowflake
+        with:
+          environment: prod
+          snowflake-account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+
+      - name: Install dbt
+        run: pip install dbt-snowflake
+
+      - name: dbt deps
+        run: dbt deps || true
+
+      - name: dbt build → PROD (full build)
+        run: dbt build --target prod
+
+      # Upload manifest so CI can use it for defer on next PR
+      - name: Upload prod manifest as artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-manifest
+          path: target/manifest.json
+          retention-days: 30
+          overwrite: true       # always keep latest prod manifest
