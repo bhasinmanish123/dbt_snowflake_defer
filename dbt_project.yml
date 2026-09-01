@@ -16,5 +16,5 @@ clean-targets:
   - "dbt_packages"
 
 models:
-  dbt_snowflake_wif:
+  dbt_snowflake_defer:
     +materialized: view
